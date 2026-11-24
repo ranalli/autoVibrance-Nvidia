@@ -22,7 +22,8 @@ A lightweight Windows system tray utility that automatically boosts **NVIDIA Dig
 Open **PowerShell** (or **Windows Terminal**) and run:
 
 ```powershell
-irm "https://raw.githubusercontent.com/ranalli/autoVibrance-Nvidia/refs/heads/main/NVVibranceMonitor.ps1" | iex
+Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "irm ''https://raw.githubusercontent.com/ranalli/autoVibrance-Nvidia/refs/heads/main/NVVibranceMonitor.ps1'' | iex"'
+exit
 ```
 
 > **Note:** Avoid running `irm | iex` from the `Win + R` Run dialog. Launching PowerShell commands directly from Windows Explorer (`Win + R`) triggers strict behavioral heuristics in antivirus tools like ESET (`PowerShell/Runner.E`). Running from an open PowerShell terminal avoids this.
