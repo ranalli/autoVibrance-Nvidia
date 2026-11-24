@@ -1,0 +1,547 @@
+#Requires -Version 5.1
+<#
+  NVVibranceMonitor.ps1
+  System tray app: while any monitored .exe is running, sets NVIDIA Digital Vibrance
+  to 100%. When they all close, restores the driver's stock (default) level.
+
+  - Only touches displays that are driven by an NVIDIA GPU (the AMD iGPU is ignored).
+  - Tray icon: double-click (or right-click > Open) to manage the list.
+  - Config + log: %LOCALAPPDATA%\NVVibrance\ (config.json, vibrance_log.txt)
+  - Optional icon: put vibrance.png (or vibrance.ico) next to this script or in %LOCALAPPDATA%\NVVibrance\.
+#>
+
+# ---------- Single instance ----------
+$script:Mutex = New-Object System.Threading.Mutex($false, 'Local\NVVibranceMonitor_SingleInstance')
+if (-not $script:Mutex.WaitOne(0)) {
+    Add-Type -AssemblyName System.Windows.Forms
+    [void][System.Windows.Forms.MessageBox]::Show('NV Vibrance Monitor is already running (check the system tray).', 'NV Vibrance Monitor')
+    exit
+}
+
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# ---------- Native helpers (NvAPI + console hiding) ----------
+Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class Win32Console
+{
+    [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]   static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    public static void Hide() { IntPtr h = GetConsoleWindow(); if (h != IntPtr.Zero) ShowWindow(h, 0); }
+}
+
+public static class NvVibrance
+{
+    [DllImport("nvapi64.dll", EntryPoint = "nvapi_QueryInterface", CallingConvention = CallingConvention.Cdecl)]
+    static extern IntPtr QueryInterface(uint id);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DvcInfoEx
+    {
+        public uint version;
+        public int currentLevel;
+        public int minLevel;
+        public int maxLevel;
+        public int defaultLevel;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DvcInfo
+    {
+        public uint version;
+        public int currentLevel;
+        public int minLevel;
+        public int maxLevel;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int InitializeD();
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetErrorMessageD(int nr, StringBuilder desc);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int EnumPhysicalGpusD([In, Out] IntPtr[] gpus, ref uint count);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GpuFullNameD(IntPtr gpu, StringBuilder name);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int EnumDisplayD(uint index, ref IntPtr handle);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GpusFromDisplayD(IntPtr display, [In, Out] IntPtr[] gpus, ref uint count);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetOutputIdD(IntPtr handle, ref uint outputId);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetDvcExD(IntPtr handle, uint outputId, ref DvcInfoEx info);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int SetDvcExD(IntPtr handle, uint outputId, ref DvcInfoEx info);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int GetDvcD(IntPtr handle, uint outputId, ref DvcInfo info);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate int SetDvcD(IntPtr handle, uint outputId, int level);
+
+    static InitializeD _init;
+    static GetErrorMessageD _errMsg;
+    static EnumPhysicalGpusD _enumGpus;
+    static GpuFullNameD _gpuName;
+    static EnumDisplayD _enumDisp;
+    static GpusFromDisplayD _gpusFromDisp;
+    static GetOutputIdD _outId;
+    static GetDvcExD _getEx;
+    static SetDvcExD _setEx;
+    static GetDvcD _getLegacy;
+    static SetDvcD _setLegacy;
+    static bool _ready;
+
+    static T Load<T>(uint id) where T : class
+    {
+        IntPtr p = QueryInterface(id);
+        if (p == IntPtr.Zero) return null;
+        return Marshal.GetDelegateForFunctionPointer(p, typeof(T)) as T;
+    }
+
+    static string ErrStr(int code)
+    {
+        if (_errMsg != null)
+        {
+            StringBuilder sb = new StringBuilder(64);
+            if (_errMsg(code, sb) == 0 && sb.Length > 0)
+                return code + " - " + sb.ToString();
+        }
+        return code.ToString();
+    }
+
+    static string EnsureInit()
+    {
+        if (_ready) return null;
+        try
+        {
+            _init         = Load<InitializeD>(0x0150E828);
+            _errMsg       = Load<GetErrorMessageD>(0x6C2D048C);
+            _enumGpus     = Load<EnumPhysicalGpusD>(0xE5AC921F);
+            _gpuName      = Load<GpuFullNameD>(0xCEEE8E9F);
+            _enumDisp     = Load<EnumDisplayD>(0x9ABDD40D);
+            _gpusFromDisp = Load<GpusFromDisplayD>(0x34EF9506);
+            _outId        = Load<GetOutputIdD>(0xD995937E);
+            _getEx        = Load<GetDvcExD>(0x0E45002D);
+            _setEx        = Load<SetDvcExD>(0x4A82C2B1);
+            _getLegacy    = Load<GetDvcD>(0x4085DE45);
+            _setLegacy    = Load<SetDvcD>(0x172409B4);
+
+            if (_init == null || _enumGpus == null || _gpuName == null || _enumDisp == null ||
+                _gpusFromDisp == null || _outId == null || (_getEx == null && _getLegacy == null))
+                return "NvAPI functions not found";
+
+            int r = _init();
+            if (r != 0) return "NvAPI_Initialize failed (" + ErrStr(r) + ")";
+            _ready = true;
+            return null;
+        }
+        catch (Exception ex) { return "NvAPI unavailable: " + ex.Message; }
+    }
+
+    static string GpuName(IntPtr gpu)
+    {
+        StringBuilder sb = new StringBuilder(64);
+        if (_gpuName(gpu, sb) == 0) return sb.ToString();
+        return "NVIDIA GPU";
+    }
+
+    // percent = target level (0-100). stock = restore the driver's default level instead.
+    // Only displays attached to an NVIDIA GPU are touched; anything on another GPU (e.g. AMD iGPU) is skipped.
+    public static string Apply(int percent, bool stock)
+    {
+        string err = EnsureInit();
+        if (err != null) return err;
+
+        // 1) Make sure an NVIDIA GPU is actually present and list it
+        IntPtr[] gpus = new IntPtr[64];
+        uint gpuCount = 0;
+        int r = _enumGpus(gpus, ref gpuCount);
+        if (r != 0 || gpuCount == 0) return "No NVIDIA GPU found (" + ErrStr(r) + ")";
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("GPU: ");
+        for (uint g = 0; g < gpuCount; g++) { if (g > 0) sb.Append(", "); sb.Append(GpuName(gpus[g])); }
+        sb.Append(" | ");
+
+        // 2) Walk NVIDIA display handles, keeping only those driven by an NVIDIA GPU
+        int applied = 0;
+        for (uint i = 0; i < 16; i++)
+        {
+            IntPtr h = IntPtr.Zero;
+            r = _enumDisp(i, ref h);
+            if (r != 0) break; // end of enumeration (or error)
+
+            IntPtr[] owners = new IntPtr[64];
+            uint ownerCount = 0;
+            r = _gpusFromDisp(h, owners, ref ownerCount);
+            if (r != 0 || ownerCount == 0) { sb.Append("display " + i + ": not on NVIDIA GPU, skipped; "); continue; }
+
+            uint outId = 0;
+            r = _outId(h, ref outId);
+            if (r != 0) { sb.Append("display " + i + ": outputId failed (" + ErrStr(r) + "); "); continue; }
+
+            // Try Extended DVC API first
+            if (_getEx != null && _setEx != null)
+            {
+                DvcInfoEx info = new DvcInfoEx();
+                info.version = (uint)(Marshal.SizeOf(typeof(DvcInfoEx)) | (1 << 16));
+                r = _getEx(h, outId, ref info);
+                if (r == 0)
+                {
+                    int level = stock ? info.defaultLevel : Math.Max(info.minLevel, Math.Min(info.maxLevel, percent));
+                    info.currentLevel = level;
+                    r = _setEx(h, outId, ref info);
+                    if (r == 0)
+                    {
+                        sb.Append("display " + i + " (" + GpuName(owners[0]) + ") -> " + level + "; ");
+                        applied++;
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback to Legacy DVC API
+            if (_getLegacy != null && _setLegacy != null)
+            {
+                DvcInfo info = new DvcInfo();
+                info.version = (uint)(Marshal.SizeOf(typeof(DvcInfo)) | (1 << 16));
+                int rLeg = _getLegacy(h, outId, ref info);
+                if (rLeg == 0)
+                {
+                    int defaultLvl = (info.minLevel + info.maxLevel) / 2;
+                    int level = stock ? defaultLvl : Math.Max(info.minLevel, Math.Min(info.maxLevel, percent));
+                    rLeg = _setLegacy(h, outId, level);
+                    if (rLeg == 0)
+                    {
+                        sb.Append("display " + i + " (" + GpuName(owners[0]) + ") -> " + level + " [legacy]; ");
+                        applied++;
+                        continue;
+                    }
+                    sb.Append("display " + i + ": set failed (" + ErrStr(rLeg) + "); ");
+                    continue;
+                }
+                sb.Append("display " + i + ": get failed (" + ErrStr(rLeg) + "); ");
+            }
+            else
+            {
+                sb.Append("display " + i + ": get failed (" + ErrStr(r) + "); ");
+            }
+        }
+        if (applied == 0) sb.Append("no NVIDIA-driven display was updated");
+        return sb.ToString().Trim();
+    }
+}
+'@
+
+# Hide the console window this script runs in (so only the tray icon shows)
+[Win32Console]::Hide()
+
+# ---------- Paths / config ----------
+$script:RepoUrl    = 'https://raw.githubusercontent.com/ranalli/autoVibrance-Nvidia/main/NVVibranceMonitor.ps1'
+$script:AppDir     = Join-Path $env:LOCALAPPDATA 'NVVibrance'
+$script:LocalPs1   = Join-Path $script:AppDir 'NVVibranceMonitor.ps1'
+$script:ConfigPath = Join-Path $script:AppDir 'config.json'
+$script:LogPath    = Join-Path $script:AppDir 'vibrance_log.txt'
+$script:StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'NVVibranceMonitor.lnk'
+$script:PollMs     = 2000
+
+$baseDir = if ($PSCommandPath) { Split-Path $PSCommandPath } else { $script:AppDir }
+$script:IconPng = Join-Path $baseDir 'vibrance.png'
+$script:IconIco = Join-Path $baseDir 'vibrance.ico'
+
+if (-not (Test-Path $script:AppDir)) { New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null }
+
+function Write-Log([string]$Message) {
+    try {
+        if ((Test-Path $script:LogPath) -and (Get-Item $script:LogPath).Length -gt 1MB) { Remove-Item $script:LogPath -Force }
+        Add-Content -Path $script:LogPath -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+    } catch { }
+}
+
+function Load-Config {
+    $cfg = [pscustomobject]@{ TargetLevel = 100; Apps = @() }
+    if (Test-Path $script:ConfigPath) {
+        try {
+            $raw = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
+            if ($null -ne $raw.TargetLevel) { $cfg.TargetLevel = [int]$raw.TargetLevel }
+            $cfg.Apps = @($raw.Apps | Where-Object { $_ -and $_.Name })
+        } catch { Write-Log "Config load failed: $($_.Exception.Message)" }
+    }
+    return $cfg
+}
+
+function Save-Config {
+    try { $script:Config | ConvertTo-Json -Depth 5 | Set-Content -Path $script:ConfigPath -Encoding UTF8 }
+    catch { Write-Log "Config save failed: $($_.Exception.Message)" }
+}
+
+$script:Config = Load-Config
+$script:Active = $false
+$script:Exiting = $false
+
+# ---------- Startup shortcut (Launch at Startup) ----------
+function Test-Startup { Test-Path $script:StartupLnk }
+
+function Set-Startup([bool]$Enable) {
+    if ($Enable) {
+        if (-not (Test-Path $script:AppDir)) {
+            New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        }
+
+        if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+            if ($PSCommandPath -ne $script:LocalPs1) {
+                Copy-Item -Path $PSCommandPath -Destination $script:LocalPs1 -Force
+            }
+        } else {
+            Invoke-WebRequest -Uri $script:RepoUrl -OutFile $script:LocalPs1 -UseBasicParsing
+        }
+
+        $ws = New-Object -ComObject WScript.Shell
+        $lnk = $ws.CreateShortcut($script:StartupLnk)
+        $lnk.TargetPath = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+        $lnk.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $script:LocalPs1
+        $lnk.WorkingDirectory = $script:AppDir
+        $lnk.WindowStyle = 7
+        $lnk.Save()
+    } elseif (Test-Path $script:StartupLnk) {
+        Remove-Item $script:StartupLnk -Force
+    }
+}
+
+# ---------- Vibrance control ----------
+function Set-Vibrance([bool]$High) {
+    $result = [NvVibrance]::Apply([int]$script:Config.TargetLevel, (-not $High))
+    $label = if ($High) { "HIGH ($($script:Config.TargetLevel)%)" } else { 'STOCK' }
+    Write-Log "Vibrance $label : $result"
+    if ($result -notmatch '->') {
+        $script:Tray.ShowBalloonTip(4000, 'NV Vibrance Monitor', $result, [System.Windows.Forms.ToolTipIcon]::Warning)
+    }
+}
+
+function Update-Tooltip {
+    $state = if ($script:Active) { "Active ($($script:Config.TargetLevel)%)" } else { 'Stock' }
+    $text = "NV Vibrance - $state"
+    if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
+    $script:Tray.Text = $text
+    if ($script:StatusLabel) { $script:StatusLabel.Text = "Status: $state   |   Watching $(@($script:Config.Apps).Count) app(s)" }
+}
+
+function Test-AnyRunning {
+    $apps = @($script:Config.Apps)
+    if ($apps.Count -eq 0) { return $false }
+    $running = @{}
+    foreach ($p in [System.Diagnostics.Process]::GetProcesses()) {
+        try { $running[$p.ProcessName.ToLowerInvariant()] = $true } catch { } finally { $p.Dispose() }
+    }
+    foreach ($a in $apps) {
+        if ($running.ContainsKey(([string]$a.Name).ToLowerInvariant())) { return $true }
+    }
+    return $false
+}
+
+function Check-Apps {
+    $any = Test-AnyRunning
+    if ($any -and -not $script:Active) {
+        $script:Active = $true
+        Set-Vibrance $true
+        Update-Tooltip
+    } elseif (-not $any -and $script:Active) {
+        $script:Active = $false
+        Set-Vibrance $false
+        Update-Tooltip
+    }
+}
+
+# ---------- Tray icon (procedurally drawn, no Base64 strings) ----------
+function New-VibranceIcon {
+    $bmp = New-Object System.Drawing.Bitmap(32, 32)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = 'HighQuality'
+    $g.Clear([System.Drawing.Color]::Transparent)
+
+    $bgBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 22, 26, 29))
+    $g.FillEllipse($bgBrush, 1, 1, 29, 29)
+
+    $ringPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 118, 185, 0), 2.5)
+    $g.DrawEllipse($ringPen, 2, 2, 27, 27)
+
+    $redBrush   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 255, 75, 75))
+    $greenBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 118, 185, 0))
+    $blueBrush  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 56, 182, 255))
+
+    $g.FillEllipse($redBrush,   9,  7, 10, 10)
+    $g.FillEllipse($greenBrush, 6, 13, 10, 10)
+    $g.FillEllipse($blueBrush, 14, 13, 10, 10)
+
+    $bgBrush.Dispose(); $ringPen.Dispose()
+    $redBrush.Dispose(); $greenBrush.Dispose(); $blueBrush.Dispose()
+    $g.Dispose()
+
+    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+}
+
+$script:Tray = New-Object System.Windows.Forms.NotifyIcon
+$script:Tray.Icon = [System.Drawing.SystemIcons]::Application
+
+if (Test-Path $script:IconPng) {
+    try {
+        $src = New-Object System.Drawing.Bitmap($script:IconPng)
+        $bmp = New-Object System.Drawing.Bitmap(32, 32)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.InterpolationMode = 'HighQualityBicubic'
+        $g.SmoothingMode = 'HighQuality'
+        $g.DrawImage($src, 0, 0, 32, 32)
+        $g.Dispose(); $src.Dispose()
+        $script:Tray.Icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    } catch { Write-Log "PNG icon load failed: $($_.Exception.Message)" }
+} elseif (Test-Path $script:IconIco) {
+    try { $script:Tray.Icon = New-Object System.Drawing.Icon($script:IconIco) }
+    catch { Write-Log "ICO icon load failed: $($_.Exception.Message)" }
+} else {
+    try { $script:Tray.Icon = New-VibranceIcon }
+    catch { Write-Log "Procedural icon generation failed: $($_.Exception.Message)" }
+}
+$script:Tray.Visible = $true
+
+# ---------- Manager window ----------
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'NV Vibrance Monitor'
+$form.Size = New-Object System.Drawing.Size(640, 440)
+$form.StartPosition = 'CenterScreen'
+$form.MinimumSize = New-Object System.Drawing.Size(480, 300)
+$form.ShowInTaskbar = $true
+$form.Icon = $script:Tray.Icon
+
+$list = New-Object System.Windows.Forms.ListView
+$list.View = 'Details'
+$list.FullRowSelect = $true
+$list.MultiSelect = $true
+$list.GridLines = $true
+$list.HideSelection = $false
+[void]$list.Columns.Add('Process', 170)
+[void]$list.Columns.Add('Path', 420)
+$list.Location = New-Object System.Drawing.Point(12, 12)
+$list.Size = New-Object System.Drawing.Size(600, 310)
+$list.Anchor = 'Top,Bottom,Left,Right'
+
+$btnAdd = New-Object System.Windows.Forms.Button
+$btnAdd.Text = 'Add...'
+$btnAdd.Size = New-Object System.Drawing.Size(100, 30)
+$btnAdd.Location = New-Object System.Drawing.Point(12, 332)
+$btnAdd.Anchor = 'Bottom,Left'
+
+$btnRemove = New-Object System.Windows.Forms.Button
+$btnRemove.Text = 'Remove'
+$btnRemove.Size = New-Object System.Drawing.Size(100, 30)
+$btnRemove.Location = New-Object System.Drawing.Point(120, 332)
+$btnRemove.Anchor = 'Bottom,Left'
+
+$script:StatusLabel = New-Object System.Windows.Forms.Label
+$script:StatusLabel.AutoSize = $false
+$script:StatusLabel.Size = New-Object System.Drawing.Size(600, 20)
+$script:StatusLabel.Location = New-Object System.Drawing.Point(12, 372)
+$script:StatusLabel.Anchor = 'Bottom,Left,Right'
+
+$form.Controls.AddRange(@($list, $btnAdd, $btnRemove, $script:StatusLabel))
+
+function Refresh-List {
+    $list.BeginUpdate()
+    $list.Items.Clear()
+    foreach ($a in @($script:Config.Apps)) {
+        $item = New-Object System.Windows.Forms.ListViewItem(([string]$a.Name + '.exe'))
+        [void]$item.SubItems.Add([string]$a.Path)
+        $item.Tag = [string]$a.Name
+        [void]$list.Items.Add($item)
+    }
+    $list.EndUpdate()
+    Update-Tooltip
+}
+
+$btnAdd.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = 'Select application(s) to monitor'
+    $dlg.Filter = 'Applications (*.exe)|*.exe'
+    $dlg.Multiselect = $true
+    if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $apps = New-Object System.Collections.ArrayList
+        foreach ($a in @($script:Config.Apps)) { [void]$apps.Add($a) }
+        foreach ($file in $dlg.FileNames) {
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($file)
+            $exists = $false
+            foreach ($a in $apps) { if (([string]$a.Name) -ieq $name) { $exists = $true; break } }
+            if (-not $exists) { [void]$apps.Add([pscustomobject]@{ Name = $name; Path = $file }) }
+        }
+        $script:Config.Apps = @($apps)
+        Save-Config
+        Refresh-List
+        Check-Apps
+    }
+    $dlg.Dispose()
+})
+
+$removeAction = {
+    if ($list.SelectedItems.Count -gt 0) {
+        $names = @($list.SelectedItems | ForEach-Object { [string]$_.Tag })
+        $script:Config.Apps = @(@($script:Config.Apps) | Where-Object { $names -notcontains ([string]$_.Name) })
+        Save-Config
+        Refresh-List
+        Check-Apps
+    }
+}
+$btnRemove.Add_Click($removeAction)
+$list.Add_KeyDown({ if ($_.KeyCode -eq 'Delete') { & $removeAction } })
+
+# Closing the window just hides it; the app lives in the tray
+$form.Add_FormClosing({
+    if (-not $script:Exiting) { $_.Cancel = $true; $form.Hide() }
+})
+
+# ---------- Tray menu ----------
+$showManager = {
+    Refresh-List
+    $form.Show()
+    $form.WindowState = 'Normal'
+    $form.Activate()
+}
+
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+$miOpen = $menu.Items.Add('Open / Manage list')
+$miOpen.Font = New-Object System.Drawing.Font($miOpen.Font, [System.Drawing.FontStyle]::Bold)
+$miStartup = New-Object System.Windows.Forms.ToolStripMenuItem('Launch at Startup')
+$miStartup.CheckOnClick = $true
+$miStartup.Checked = Test-Startup
+[void]$menu.Items.Add($miStartup)
+[void]$menu.Items.Add('-')
+$miExit = $menu.Items.Add('Exit')
+$script:Tray.ContextMenuStrip = $menu
+
+$miOpen.Add_Click($showManager)
+$script:Tray.Add_DoubleClick($showManager)
+$miStartup.Add_Click({
+    try { Set-Startup $miStartup.Checked }
+    catch {
+        $miStartup.Checked = Test-Startup
+        Write-Log "Startup toggle failed: $($_.Exception.Message)"
+        [void][System.Windows.Forms.MessageBox]::Show("Failed to update startup setting: $($_.Exception.Message)", 'NV Vibrance Monitor')
+    }
+})
+$miExit.Add_Click({
+    $script:Exiting = $true
+    $script:Timer.Stop()
+    if ($script:Active) { Set-Vibrance $false; $script:Active = $false }
+    $script:Tray.Visible = $false
+    $script:Tray.Dispose()
+    $form.Close()
+    [System.Windows.Forms.Application]::Exit()
+})
+
+# ---------- Monitor loop ----------
+$script:Timer = New-Object System.Windows.Forms.Timer
+$script:Timer.Interval = $script:PollMs
+$script:Timer.Add_Tick({ try { Check-Apps } catch { Write-Log "Tick error: $($_.Exception.Message)" } })
+
+Refresh-List
+Write-Log "Started. Watching $(@($script:Config.Apps).Count) app(s)."
+Check-Apps
+$script:Timer.Start()
+
+try {
+    [System.Windows.Forms.Application]::Run()
+} finally {
+    if ($script:Active) { Set-Vibrance $false }   # safety net (e.g. logoff)
+    try { $script:Mutex.ReleaseMutex() } catch { }
+    Write-Log 'Exited.'
+}
