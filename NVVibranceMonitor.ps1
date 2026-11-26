@@ -7,7 +7,7 @@
   - Only touches displays that are driven by an NVIDIA GPU (the AMD iGPU is ignored).
   - Tray icon: double-click (or right-click > Open) to manage the list.
   - Config + log: %LOCALAPPDATA%\NVVibrance\ (config.json, vibrance_log.txt)
-  - Optional icon: put vibrance.png (or vibrance.ico) next to this script or in %LOCALAPPDATA%\NVVibrance\.
+  - Optional custom icon: put vibrance.png (or vibrance.ico) next to this script or in %LOCALAPPDATA%\NVVibrance\.
 #>
 
 # ---------- Single instance ----------
@@ -231,6 +231,7 @@ public static class NvVibrance
 
 # ---------- Paths / config ----------
 $script:RepoUrl    = 'https://raw.githubusercontent.com/ranalli/autoVibrance-Nvidia/main/NVVibranceMonitor.ps1'
+$script:IconUrl    = 'https://raw.githubusercontent.com/ranalli/autoVibrance-Nvidia/refs/heads/main/vibrance.ico'
 $script:AppDir     = Join-Path $env:LOCALAPPDATA 'NVVibrance'
 $script:LocalPs1   = Join-Path $script:AppDir 'NVVibranceMonitor.ps1'
 $script:ConfigPath = Join-Path $script:AppDir 'config.json'
@@ -239,8 +240,13 @@ $script:StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'NVVibr
 $script:PollMs     = 2000
 
 $baseDir = if ($PSCommandPath) { Split-Path $PSCommandPath } else { $script:AppDir }
-$script:IconPng = Join-Path $baseDir 'vibrance.png'
-$script:IconIco = Join-Path $baseDir 'vibrance.ico'
+$script:LocalIconPng   = Join-Path $baseDir 'vibrance.png'
+$script:LocalIconIco   = Join-Path $baseDir 'vibrance.ico'
+$script:AppDataIconPng = Join-Path $script:AppDir 'vibrance.png'
+$script:AppDataIconIco = Join-Path $script:AppDir 'vibrance.ico'
+
+# Built-in 32x32 PNG tray icon fallback (Base64 encoded)
+$script:EmbeddedIconBase64 = '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'
 
 if (-not (Test-Path $script:AppDir)) { New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null }
 
@@ -345,54 +351,65 @@ function Check-Apps {
     }
 }
 
-# ---------- Tray icon (procedurally drawn, no Base64 strings) ----------
-function New-VibranceIcon {
+# ---------- Tray icon (created first so the window can reuse it) ----------
+function Convert-BitmapToIcon([System.Drawing.Bitmap]$SourceBmp) {
     $bmp = New-Object System.Drawing.Bitmap(32, 32)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.InterpolationMode = 'HighQualityBicubic'
     $g.SmoothingMode = 'HighQuality'
-    $g.Clear([System.Drawing.Color]::Transparent)
-
-    $bgBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 22, 26, 29))
-    $g.FillEllipse($bgBrush, 1, 1, 29, 29)
-
-    $ringPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 118, 185, 0), 2.5)
-    $g.DrawEllipse($ringPen, 2, 2, 27, 27)
-
-    $redBrush   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 255, 75, 75))
-    $greenBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 118, 185, 0))
-    $blueBrush  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 56, 182, 255))
-
-    $g.FillEllipse($redBrush,   9,  7, 10, 10)
-    $g.FillEllipse($greenBrush, 6, 13, 10, 10)
-    $g.FillEllipse($blueBrush, 14, 13, 10, 10)
-
-    $bgBrush.Dispose(); $ringPen.Dispose()
-    $redBrush.Dispose(); $greenBrush.Dispose(); $blueBrush.Dispose()
+    $g.DrawImage($SourceBmp, 0, 0, 32, 32)
     $g.Dispose()
-
     return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
 
 $script:Tray = New-Object System.Windows.Forms.NotifyIcon
 $script:Tray.Icon = [System.Drawing.SystemIcons]::Application
 
-if (Test-Path $script:IconPng) {
+# If no local or AppData icon exists, download vibrance.png into %LOCALAPPDATA%\NVVibrance\
+$hasAnyIcon = (Test-Path $script:LocalIconPng) -or (Test-Path $script:LocalIconIco) -or
+              (Test-Path $script:AppDataIconPng) -or (Test-Path $script:AppDataIconIco)
+
+if (-not $hasAnyIcon) {
     try {
-        $src = New-Object System.Drawing.Bitmap($script:IconPng)
-        $bmp = New-Object System.Drawing.Bitmap(32, 32)
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.InterpolationMode = 'HighQualityBicubic'
-        $g.SmoothingMode = 'HighQuality'
-        $g.DrawImage($src, 0, 0, 32, 32)
-        $g.Dispose(); $src.Dispose()
-        $script:Tray.Icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
-    } catch { Write-Log "PNG icon load failed: $($_.Exception.Message)" }
-} elseif (Test-Path $script:IconIco) {
-    try { $script:Tray.Icon = New-Object System.Drawing.Icon($script:IconIco) }
-    catch { Write-Log "ICO icon load failed: $($_.Exception.Message)" }
-} else {
-    try { $script:Tray.Icon = New-VibranceIcon }
-    catch { Write-Log "Procedural icon generation failed: $($_.Exception.Message)" }
+        Invoke-WebRequest -Uri $script:IconUrl -OutFile $script:AppDataIconPng -UseBasicParsing -ErrorAction Stop
+        Write-Log "Downloaded icon to $($script:AppDataIconPng)"
+    } catch {
+        Write-Log "Icon download failed (falling back to embedded icon): $($_.Exception.Message)"
+    }
+}
+
+$iconLoaded = $false
+foreach ($pngPath in @($script:LocalIconPng, $script:AppDataIconPng)) {
+    if (-not $iconLoaded -and (Test-Path $pngPath)) {
+        try {
+            $src = New-Object System.Drawing.Bitmap($pngPath)
+            $script:Tray.Icon = Convert-BitmapToIcon $src
+            $src.Dispose()
+            $iconLoaded = $true
+        } catch { Write-Log "PNG icon load failed ($pngPath): $($_.Exception.Message)" }
+    }
+}
+
+if (-not $iconLoaded) {
+    foreach ($icoPath in @($script:LocalIconIco, $script:AppDataIconIco)) {
+        if (-not $iconLoaded -and (Test-Path $icoPath)) {
+            try {
+                $script:Tray.Icon = New-Object System.Drawing.Icon($icoPath)
+                $iconLoaded = $true
+            } catch { Write-Log "ICO icon load failed ($icoPath): $($_.Exception.Message)" }
+        }
+    }
+}
+
+if (-not $iconLoaded -and $script:EmbeddedIconBase64) {
+    try {
+        $bytes = [Convert]::FromBase64String($script:EmbeddedIconBase64)
+        $ms = New-Object System.IO.MemoryStream(, $bytes)
+        $src = New-Object System.Drawing.Bitmap($ms)
+        $script:Tray.Icon = Convert-BitmapToIcon $src
+        $src.Dispose()
+        $ms.Dispose()
+    } catch { Write-Log "Embedded icon load failed: $($_.Exception.Message)" }
 }
 $script:Tray.Visible = $true
 
